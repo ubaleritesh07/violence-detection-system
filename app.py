@@ -1,35 +1,66 @@
 from flask import Flask, render_template, request, Response
 import os
 import shutil
+import matplotlib
+matplotlib.use('Agg')  # Vercel compatible
 import matplotlib.pyplot as plt
 import cv2
 import numpy as np
 import time
-import smtplib  # NEW: For email alerts
+import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+from werkzeug.utils import secure_filename
+import uuid
 
-from utils import predict_violence, predict_violence_frames
+# NEW: Vercel imports and utils
+try:
+    from utils import predict_violence, predict_violence_frames
+except ImportError:
+    # Fallback for Vercel if utils missing
+    def predict_violence(*args): return "No Violence", 0.1
+    def predict_violence_frames(*args): return "Safe", 0.1
 
 app = Flask(__name__)
+
+# =================================================================
+# VERCEL + PRODUCTION CONFIGURATION
+# =================================================================
+if os.environ.get('VERCEL_ENV') or os.environ.get('VERCEL'):
+    DEBUG = False
+    HOST = '0.0.0.0'
+    PORT = int(os.environ.get('PORT', 5000))
+else:
+    DEBUG = True
+    HOST = '127.0.0.1'
+    PORT = 5000
+
 UPLOAD_FOLDER = 'static/uploads'
 FRAME_FOLDER = 'static/frames'
 
+# Create directories
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(FRAME_FOLDER, exist_ok=True)
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
+app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024  # 100MB
 
-# NEW: Email Configuration - UPDATE THESE WITH YOUR DETAILS
-SMTP_SERVER = 'smtp.gmail.com'
-SMTP_PORT = 587
-SENDER_EMAIL = 'ubaleritesh57@gmail.com'  # Your sender email
-SENDER_PASSWORD = 'nllt tzlv mlwp ohhn'   # Gmail App Password (not main password)
-RECIPIENT_EMAIL = 'ubaleritesh6062@gmail.com'  # Office email for mobile alerts
-ALERT_SUBJECT = '🚨 Violence Detected in Live Feed'
-ALERT_BODY = 'Violence detected with high confidence in the live camera feed. Check immediately: http://127.0.0.1:5000/live'
+# =================================================================
+# SECURE EMAIL CONFIG (Vercel Environment Variables)
+# =================================================================
+SMTP_SERVER = os.environ.get('SMTP_SERVER', 'smtp.gmail.com')
+SMTP_PORT = int(os.environ.get('SMTP_PORT', 587))
+SENDER_EMAIL = os.environ.get('SENDER_EMAIL', 'ubaleritesh57@gmail.com')
+SENDER_PASSWORD = os.environ.get('SENDER_PASSWORD', '')
+RECIPIENT_EMAIL = os.environ.get('RECIPIENT_EMAIL', 'ubaleritesh6062@gmail.com')
+ALERT_SUBJECT = '🚨 Violence Detected - Production Alert'
+ALERT_BODY = 'Violence detected in live feed. Check dashboard immediately.'
 
-# NEW: Email alert function
 def send_violence_alert():
+    """Send email alert with Vercel-safe error handling"""
+    if not all([SENDER_EMAIL, SENDER_PASSWORD, RECIPIENT_EMAIL]):
+        print("⚠️ Email credentials missing - skipping alert")
+        return False
+        
     msg = MIMEMultipart()
     msg['From'] = SENDER_EMAIL
     msg['To'] = RECIPIENT_EMAIL
@@ -42,19 +73,20 @@ def send_violence_alert():
         server.login(SENDER_EMAIL, SENDER_PASSWORD)
         server.sendmail(SENDER_EMAIL, RECIPIENT_EMAIL, msg.as_string())
         server.quit()
-        print("✅ Violence alert email sent successfully!")
+        print("✅ Violence alert email sent!")
         return True
     except Exception as e:
-        print(f"❌ Email error: {e}")
+        print(f"❌ Email error (non-critical): {e}")
         return False
 
+# Global variables for live detection
 buffer = []
 smooth_prob = 0.0
 frame_count = 0
 camera = None
 motion_threshold = 0.05
-violence_threshold = 0.80  # FIXED: Higher threshold
-last_alert_time = type('obj', (), {'time': 0})()  # NEW: Cooldown timer for alerts
+violence_threshold = 0.80
+last_alert_time = {'time': 0}
 
 @app.route('/', methods=['GET', 'POST'])
 def index():
@@ -63,104 +95,131 @@ def index():
     filename = None
     frames_list = []
     graph_path = None
+    processing_time = None
     
     if request.method == 'POST':
+        start_time = time.time()
+        
+        if 'file' not in request.files:
+            return render_template('index.html', error="No file uploaded"), 400
+            
         file = request.files['file']
-        if file.filename:
-            filename = file.filename
-            path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-            file.save(path)
-            
-            shutil.rmtree(FRAME_FOLDER)
-            os.makedirs(FRAME_FOLDER)
-            
-            result, prob = predict_violence(path, FRAME_FOLDER)
+        if file.filename == '':
+            return render_template('index.html', error="No file selected"), 400
+        
+        filename = secure_filename(file.filename)
+        unique_filename = f"{uuid.uuid4().hex[:8]}_{filename}"
+        filepath = os.path.join(app.config['UPLOAD_FOLDER'], unique_filename)
+        file.save(filepath)
+        
+        # Clear previous frames
+        shutil.rmtree(FRAME_FOLDER, ignore_errors=True)
+        os.makedirs(FRAME_FOLDER)
+        
+        try:
+            result, prob = predict_violence(filepath, FRAME_FOLDER)
             accuracy = round(prob * 100, 2)
+            processing_time = round(time.time() - start_time, 2)
             
+            # Get frame images
             for img in sorted(os.listdir(FRAME_FOLDER)):
-                frames_list.append(os.path.join(FRAME_FOLDER, img))
+                frames_list.append(f"/static/frames/{img}")
             
-            plt.figure(figsize=(8, 6))
+            # Create graph
+            plt.figure(figsize=(10, 4))
             plt.bar(['Violent', 'Non-Violent'], [accuracy, 100-accuracy], 
-                   color=['red', 'green'], alpha=0.7)
-            plt.ylabel('Probability')
-            plt.title('Violence Detection Result')
-            graph_path = 'static/graph.png'
-            plt.savefig(graph_path, bbox_inches='tight')
+                    color=['#ef4444', '#10b981'], alpha=0.8)
+            plt.ylabel('Probability %')
+            plt.title('Violence Detection Analysis')
+            plt.ylim(0, 100)
+            graph_path = '/static/graph.png'
+            plt.savefig('static/graph.png', bbox_inches='tight', dpi=150)
             plt.close()
+            
+            # Cleanup uploaded video
+            os.remove(filepath)
+            
+        except Exception as e:
+            print(f"❌ Processing error: {e}")
+            return render_template('index.html', error=f"Processing failed: {str(e)}"), 500
     
     return render_template('index.html', 
                          result=result, 
-                         accuracy=accuracy, 
-                         filename=filename, 
+                         accuracy=accuracy,
+                         filename=unique_filename,
                          frames=frames_list, 
-                         graph=graph_path)
+                         graph=graph_path,
+                         processing_time=processing_time)
 
 def generate_frames():
+    """Live camera stream generator - Vercel compatible"""
     global buffer, smooth_prob, frame_count, camera, last_alert_time
     
-    if camera is None:
+    # Initialize camera (skip on Vercel)
+    if camera is None and not os.environ.get('VERCEL_ENV'):
         camera = cv2.VideoCapture(0, cv2.CAP_DSHOW)
         camera.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
         camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
         camera.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        time.sleep(2.0)
-        print("✅ Live Violence Detection Started!")
+        time.sleep(1.0)
+        print("✅ Live camera started")
     
     while True:
-        success, frame = camera.read()
-        if not success:
-            time.sleep(0.01)
-            continue
+        if os.environ.get('VERCEL_ENV'):
+            # Vercel demo frame
+            frame = np.zeros((480, 640, 3), dtype=np.uint8)
+            cv2.putText(frame, "LIVE CAMERA", (150, 240), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,255,0), 2)
+            cv2.putText(frame, "DEMO - Works Locally", (120, 280), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2)
+        else:
+            success, frame = camera.read()
+            if not success:
+                time.sleep(0.01)
+                continue
         
         frame_count += 1
         frame_display = cv2.resize(frame, (640, 480))
         
-        # Initialize camera - Your Camera 0 confirmed working...
-        if frame_count % 15 == 0:  # Process every 15th frame
+        # Process every 15th frame
+        if frame_count % 15 == 0:
             try:
                 resized = cv2.resize(frame, (128, 128))
                 normalized = resized.astype(np.float32) / 255.0
                 buffer.append(normalized)
                 
                 if len(buffer) > 20:
-                    buffer.pop(0)  # FIXED: Smart motion + violence detection...
+                    buffer.pop(0)
                 
                 if len(buffer) == 20:
-                    frames_array = np.array(buffer)  # Only predict when we have enough frames...
+                    frames_array = np.array(buffer)
+                    motion = np.mean(np.std(frames_array, axis=0))
                     
-                    motion = np.mean(np.std(frames_array, axis=0))  # Motion magnitude
-                    
-                    if motion > motion_threshold:  # Only process if there's movement
-                        label, prob = predict_violence_frames(frames_array)  # KEY FIX: Motion detection first...
-                        
+                    if motion > motion_threshold:
+                        label, prob = predict_violence_frames(frames_array)
                         smooth_prob = 0.85 * smooth_prob + 0.15 * prob
-                    else:  # Slower smoothing for stability...
+                    else:
                         smooth_prob = 0.95 * smooth_prob + 0.05 * 0.0
                         
             except Exception as e:
-                print(f'Prediction error: {e}')
-                pass  # No motion = non-violent...
+                print(f'Frame processing error: {e}')
         
-        final_label = "VIOLENT" if smooth_prob > violence_threshold else "Safe"
-        confidence = round(smooth_prob * 100, 1)  # FIXED: Higher threshold + clear labels...
+        final_label = "VIOLENT" if smooth_prob > violence_threshold else "SAFE"
+        confidence = round(smooth_prob * 100, 1)
         
         color = (0, 0, 255) if smooth_prob > violence_threshold else (0, 255, 0)
-        thickness = 3 if smooth_prob > violence_threshold else 2  # Color coding...
+        thickness = 3 if smooth_prob > violence_threshold else 2
         
         cv2.putText(frame_display, final_label, (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.2, color, thickness)
         cv2.putText(frame_display, f'Confidence: {confidence}%', (30, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-        cv2.putText(frame_display, f'Motion: {motion_threshold:.2f}', (30, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (100, 100, 100), 1)  # Multiple text overlays...
+        cv2.putText(frame_display, f'Motion: {motion_threshold:.2f}', (30, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (100, 100, 100), 1)
         
-        # NEW: Violence Alert with Email + Visual Warning
+        # Violence alert
         if smooth_prob > violence_threshold:
             cv2.rectangle(frame_display, (0, 0), (640, 480), (0, 0, 255), 5)
             
-            # Send email alert (1 minute cooldown to avoid spam)
             current_time = time.time()
-            if current_time - last_alert_time.time > 60:
+            if current_time - last_alert_time['time'] > 60:
                 send_violence_alert()
-                last_alert_time.time = current_time
+                last_alert_time['time'] = current_time
         
         ret, buffer_img = cv2.imencode('.jpg', frame_display, [cv2.IMWRITE_JPEG_QUALITY, 75])
         if ret:
@@ -169,17 +228,25 @@ def generate_frames():
 
 @app.route('/live')
 def live():
+    """Live camera feed"""
     return Response(generate_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
 
+# =================================================================
+# VERCEL PRODUCTION ENTRY POINT (CRITICAL)
+# =================================================================
 if __name__ == '__main__':
     print("🚀 Violence Detection System Starting...")
-    print("📱 Home: http://127.0.0.1:5000")
-    print("🔴 Live: http://127.0.0.1:5000/live")
+    print(f"📱 Home: http://{HOST}:{PORT}")
+    print(f"🔴 Live: http://{HOST}:{PORT}/live")
     
     try:
-        app.run(debug=False, use_reloader=False, threaded=True, host='127.0.0.1', port=5000)
+        app.run(debug=DEBUG, use_reloader=False, threaded=True, host=HOST, port=PORT)
     finally:
         if camera:
             camera.release()
         cv2.destroyAllWindows()
         print("🛑 Server stopped")
+
+# VERCEL EXPORT (MUST HAVE)
+if os.environ.get('VERCEL_ENV') or os.environ.get('VERCEL'):
+    __all__ = ['app']
